@@ -27,10 +27,12 @@ if [[ ! -f "$QL_FILE" ]]; then
 	EOF" && chown "$SUDO_USER:$SUDO_USER" "$QL_FILE"
 fi
 
-#Install and setup ufw
+#Install and setup ufw (Kiwix, OpenWeb UI, Ollama)
 apt install ufw -y
 ufw --force enable
 ufw allow 8080/tcp
+ufw allow 3000/tcp
+ufw allow 11434/tcp
 
 #Install docker
 if ! command -v docker &> /dev/null; then
@@ -40,7 +42,7 @@ if ! command -v docker &> /dev/null; then
 
     echo \
       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-      $(. /etc/os-release && echo "$CODENAME") stable" | tee /etc/apt/sources.list.p/docker.list > /dev/null
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
     apt-get update
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -51,8 +53,21 @@ if [[ ! -d "/usr/share/ollama" ]]; then
 	curl -fsSL https://ollama.com/install.sh | sh
 	export PATH="$HOME/.ollama/bin:$PATH"
 fi
-if [[ ! -f "/usr/share/ollama/.ollama/models/manifests/registry.ollama.ai/library/qwen3.5" ]]; then 
-	sudo ollama pull qwen3.5:0.8b
+ollama serve 2>/dev/null &
+if [[ ! -f "/home/$SUDO_USER/.ollama/models/manifests/registry.ollama.ai/library/qwen3.5" ]]; then 
+	ollama pull qwen3.5:0.8b
+fi
+#Ensure that Ollama is bound to all addresses is visible outside docker container (unsafe to allow all raffic on it's port in big production environments, good and easy for home labs)
+if [[ ! -f "/etc/systemd/system/ollama.service.d/override.conf" ]]; then
+	sudo mkdir -p /etc/systemd/system/ollama.service.d
+	sudo tee /etc/systemd/system/ollama.service.d/override.conf <<'EOF'
+	[Service]
+	Environment="OLLAMA_HOST=0.0.0.0"
+EOF
+
+	sudo systemctl daemon-reload
+	sudo systemctl enable ollama
+	sudo systemctl restart ollama
 fi
 
 #Get the Wikipedia library from kiwix web
@@ -74,21 +89,25 @@ cat <<EOF > /etc/systemd/system/kiwix.service
 [Unit]
 Description=Kiwix Offline Wikipedia Server
 After=network.target
-
+ 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/kiwix-serve --port=8080 --listen=127.0.0.1 "/home/${SUDO_USER}/Desktop/Kiwix-zims/wikipedia_en-simple_all_maxi_2026-06.zim"
+ExecStart=/usr/bin/kiwix-serve --port=8080 --address=0.0.0.0 "${ZIM_FILE}"
 Restart=on-failure
-
+ 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-#Reload and start the service
+ 
 systemctl daemon-reload
 systemctl enable kiwix.service
-systemctl start kiwix.service
+systemctl restart kiwix.service
+sleep 2
+systemctl is-active --quiet kiwix.service || {
+	echo "kiwix.service failed to start. Check: journalctl -u kiwix.service -n 50" >&2
+	exit 1
+}
 
 #Open WebUI for RetrievalAugmentedGeneration 
 docker run -d -p 3000:8080 \
@@ -96,7 +115,21 @@ docker run -d -p 3000:8080 \
   -v open-webui:/app/backend/data \
   --name open-webui \
   --restart always \
+  -e HF_HUB_OFFLINE='1' \
+  -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
   ghcr.io/open-webui/open-webui:main
 
+echo "Waiting for Open WebUI to come up..."
+for i in $(seq 1 60); do
+	if curl -sf http://localhost:3000/health >/dev/null 2>&1; then
+		break
+	fi
+	sleep 2
+done
+
 echo -e "Set-up done!"
-	
+echo -e "Access kiwix library: http://localhost:8080"
+echo -e "Access open WebUI: http://localhost:3000"	
+echo -e "1.Access open WebUI and create an admin account/log in if account allready created"
+echo -e "2.Go in Workspace->Tools->Create New Tool and paste in the python code"
+echo -e "3.Create a new model that in which you select the new created tool and can prompt it as \"What does the offline Wikipedia say about X\""
